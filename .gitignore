@@ -1,0 +1,7 @@
+tracker_data.txt
+.env
+.streamlit/secrets.toml
+__pycache__/
+.pytest_cache/
+.venv/
+*.pyc
