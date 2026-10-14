@@ -1,305 +1,428 @@
-"""Data persistence and input interpretation for the Momentum habit tracker."""
+"""Local, JSON-in-a-.txt-file persistence and calculations for Momentum.
 
+No cloud credentials are stored here. Mutations are locked and written atomically,
+so the Streamlit interface and background reminder process can safely share data.
+"""
 from __future__ import annotations
 
-from copy import deepcopy
-from datetime import date, datetime, timedelta
-from pathlib import Path
+import copy
 import json
 import os
-import re
+import shutil
 import tempfile
 import uuid
+from datetime import date, datetime, time, timedelta
+from pathlib import Path
+from typing import Callable
+from zoneinfo import ZoneInfo
 
-DATA_FILE = Path(__file__).resolve().parent / "tracker_data.txt"
-DEFAULT_HABITS = ["studying", "exercise", "reading"]
+from filelock import FileLock
+
+BASE_DIR = Path(__file__).resolve().parent
+DATA_PATH = Path(os.getenv("MOMENTUM_DATA_FILE", str(BASE_DIR / "tracker_data.txt")))
+LONDON = ZoneInfo("Europe/London")
 
 
-def fresh_data() -> dict:
-    return {"version": 1, "habits": DEFAULT_HABITS.copy(), "days": {}, "todos": [], "events": []}
+def now_local() -> datetime:
+    return datetime.now(LONDON)
 
 
-def load_data(path: Path = DATA_FILE) -> dict:
-    """Load the .txt file; create it on first use, never silently erase corrupt data."""
-    path = Path(path)
-    if not path.exists():
-        data = fresh_data()
-        save_data(data, path)
-        return data
+def default_data() -> dict:
+    return {
+        "version": 3,
+        "tasks": [],
+        "habits": [],
+        "habit_logs": {},
+        "focus_logs": [],
+        "daily_reviews": {},
+        "screen_time_logs": {},
+        "local_events": [],
+        "event_checks": {},
+        "calendar_cache": [],
+        "calendar_sync": {},
+        "notified": {},
+        "settings": {
+            "appearance": "Dark",
+            "outlook_mode": "Off",
+            "alerts_enabled": True,
+            "alert_minutes": [60, 15],
+            "sync_interval_minutes": 15,
+        },
+    }
+
+
+def _as_task(item, from_older_version: bool = False) -> dict | None:
+    if isinstance(item, str):
+        item = {"title": item}
+    if not isinstance(item, dict):
+        return None
+    title = item.get("title") or item.get("text") or item.get("task")
+    if not title:
+        return None
+    due = str(item.get("due_date") or item.get("date") or "")[:10] or None
+    plan = item.get("planned_date")
+    if from_older_version and "planned_date" not in item:
+        plan = due  # Preserve where tasks appeared in the old daily checklist.
+    plan = str(plan)[:10] if plan else None
     try:
-        with path.open("r", encoding="utf-8") as handle:
-            data = json.load(handle)
-        if not isinstance(data, dict) or not all(
-            isinstance(data.get(field), kind)
-            for field, kind in (("habits", list), ("days", dict), ("todos", list), ("events", list))
-        ):
-            raise ValueError("Invalid tracker file format")
-        return data
-    except (ValueError, OSError) as exc:
-        raise ValueError(
-            f"Could not read {path.name}. Your existing file has NOT been overwritten: {exc}"
-        ) from exc
+        minutes = max(0, min(1440, int(item.get("minutes", 0 if from_older_version else 30))))
+    except (TypeError, ValueError):
+        minutes = 0
+    return {
+        **item,
+        "id": str(item.get("id") or uuid.uuid4().hex),
+        "title": str(title),
+        "due_date": due,  # Optional deadline; not a calendar appointment.
+        "due_time": (str(item.get("due_time") or "17:00")[:5] if due else None),
+        "planned_date": plan,  # Optional day to display in Daily Planner.
+        "minutes": minutes,  # Credited to the linked habit once completed.
+        "habit_id": item.get("habit_id") or None,
+        "priority": str(item.get("priority") or "Medium"),
+        "category": str(item.get("category") or "General"),
+        "notes": str(item.get("notes") or ""),
+        "done": bool(item.get("done", item.get("completed", False))),
+        "created_at": str(item.get("created_at") or now_local().isoformat()),
+        "completed_at": item.get("completed_at"),
+    }
 
 
-def save_data(data: dict, path: Path = DATA_FILE) -> None:
-    """Write human-readable JSON to a .txt file, replacing it atomically."""
-    path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp_name = None
+def normalise(raw: dict) -> dict:
+    """Keep all old keys, and make pre-v2 habit/to-do records usable where possible."""
+    if not isinstance(raw, dict):
+        raise ValueError("tracker_data.txt must contain a JSON object")
+    data = default_data()
+    data.update(raw)
+    data["version"] = 3
+    original_tasks = raw.get("tasks") or raw.get("todos") or raw.get("to_dos") or raw.get("to_do_list") or []
+    if isinstance(original_tasks, dict):
+        original_tasks = list(original_tasks.values())
+    if not isinstance(original_tasks, list):
+        original_tasks = []
+    data["tasks"] = [t for item in original_tasks
+                     if (t := _as_task(item, from_older_version=int(raw.get("version", 1)) < 3)) is not None]
+    original_habits = raw.get("habits") or []
+    if isinstance(original_habits, dict):
+        original_habits = [{"title": k, **(v if isinstance(v, dict) else {"target_minutes": v if isinstance(v, int) else 30})}
+                           for k, v in original_habits.items()]
+    if not isinstance(original_habits, list):
+        original_habits = []
+    habits = []
+    for h in original_habits:
+        if isinstance(h, str):
+            h = {"title": h}
+        if isinstance(h, dict) and (h.get("title") or h.get("name")):
+            habits.append({**h, "id": str(h.get("id") or uuid.uuid4().hex),
+                           "title": str(h.get("title") or h.get("name")),
+                           "target_minutes": max(1, int(h.get("target_minutes") or 30)),
+                           "category": h.get("category", "General")})
+    data["habits"] = habits
+    for key in ["habit_logs", "daily_reviews", "screen_time_logs", "event_checks", "notified", "calendar_sync", "settings"]:
+        if not isinstance(data.get(key), dict):
+            data[key] = copy.deepcopy(default_data()[key])
+    for key in ["focus_logs", "calendar_cache", "local_events"]:
+        if not isinstance(data.get(key), list):
+            data[key] = []
+    data["settings"] = {**default_data()["settings"], **data["settings"]}
+    return data
+
+
+def _read_unlocked() -> dict:
+    if not DATA_PATH.exists():
+        return default_data()
     try:
-        with tempfile.NamedTemporaryFile(
-            mode="w", encoding="utf-8", dir=path.parent,
-            prefix=".tracker_", suffix=".tmp", delete=False
-        ) as handle:
-            tmp_name = handle.name
-            json.dump(data, handle, indent=2, ensure_ascii=False)
-            handle.write("\n")
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(tmp_name, path)
+        raw = json.loads(DATA_PATH.read_text(encoding="utf-8"))
+    except (ValueError, UnicodeError) as exc:
+        raise ValueError(f"Could not read {DATA_PATH.name}. Original file is untouched: {exc}") from exc
+    return normalise(raw)
+
+
+def load_data() -> dict:
+    # Files are replaced atomically: reading never sees half-written JSON.
+    return _read_unlocked()
+
+
+def _atomic_write(data: dict) -> None:
+    DATA_PATH.parent.mkdir(parents=True, exist_ok=True)
+    fd, temp_path = tempfile.mkstemp(prefix=".momentum-", suffix=".tmp", dir=DATA_PATH.parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as file:
+            json.dump(data, file, ensure_ascii=False, indent=2, default=str)
+            file.flush()
+            os.fsync(file.fileno())
+        os.replace(temp_path, DATA_PATH)
     finally:
-        if tmp_name and os.path.exists(tmp_name):
-            os.unlink(tmp_name)
+        if os.path.exists(temp_path):
+            os.remove(temp_path)
 
 
-def duration(minutes: int) -> str:
-    hours, mins = divmod(minutes, 60)
-    if hours and mins:
-        return f"{hours}h {mins}m"
-    return f"{hours}h" if hours else f"{mins}m"
-
-
-def _find_todo(todos: list, phrase: str):
-    needle = phrase.strip().casefold()
-    exact = [t for t in todos if t["text"].casefold() == needle]
-    if len(exact) == 1:
-        return exact[0], None
-    partial = [t for t in todos if needle and needle in t["text"].casefold()]
-    if len(partial) == 1:
-        return partial[0], None
-    return None, "Multiple tasks match; please use the checkbox instead." if partial else "Task not found."
-
-
-def apply_actions(data: dict, actions: list, *, today: date | None = None) -> tuple[dict, list[str], list[str]]:
-    """Validate and apply user/AI-proposed actions; returns (new_data, messages, errors)."""
-    now = datetime.now().astimezone()
-    today = today or now.date()
-    updated = deepcopy(data)
-    messages, errors = [], []
-
-    if not isinstance(actions, list):
-        return updated, messages, ["Expected a list of actions."]
-
-    for action in actions[:25]:
-        if not isinstance(action, dict):
-            errors.append("Skipped an invalid action.")
-            continue
-        kind = action.get("type")
-        summary = None
-
-        if kind == "log_habit":
-            habit = str(action.get("habit", "")).strip().lower()
-            raw_mins = action.get("minutes")
+def change(mutator: Callable[[dict], None]) -> dict:
+    with FileLock(str(DATA_PATH) + ".lock", timeout=15):
+        data = _read_unlocked()
+        # Keep the exact original data as a safety net before a version upgrade.
+        if DATA_PATH.exists():
             try:
-                mins = float(raw_mins)
-                if not mins.is_integer() or not 1 <= mins <= 1440:
-                    raise ValueError
-                mins = int(mins)
-            except (ValueError, TypeError, OverflowError):
-                errors.append(f"Invalid duration for '{habit or 'habit'}' (use 1–1440 minutes).")
-                continue
-            if not habit or len(habit) > 50:
-                errors.append("Habit name must be 1–50 characters.")
-                continue
-            day_value = str(action.get("date", today.isoformat()))
-            try:
-                day = date.fromisoformat(day_value)
-                if day > today or day.year < 2000:
-                    raise ValueError
-            except ValueError:
-                errors.append(f"Invalid date: {day_value}. Entries must be from 2000 through today.")
-                continue
-            if habit not in updated["habits"]:
-                updated["habits"].append(habit)
-            record = updated["days"].setdefault(day.isoformat(), {})
-            record[habit] = record.get(habit, 0) + mins
-            summary = f"Logged {duration(mins)} of {habit} for {day.isoformat()}."
+                old_raw = json.loads(DATA_PATH.read_text(encoding="utf-8"))
+                if int(old_raw.get("version", 1)) < 3:
+                    backup = DATA_PATH.with_name("tracker_data_before_v3.backup.txt")
+                    if not backup.exists():
+                        shutil.copy2(DATA_PATH, backup)
+            except (ValueError, AttributeError, TypeError):
+                pass
+        mutator(data)
+        _atomic_write(data)
+        return data
 
-        elif kind == "add_todo":
-            task = str(action.get("text", "")).strip()
-            if not task or len(task) > 250:
-                errors.append("To-do must contain 1–250 characters.")
-                continue
-            if any(t["text"].casefold() == task.casefold() and not t["done"] for t in updated["todos"]):
-                errors.append(f"Already on your list: {task}")
-                continue
-            updated["todos"].append({
-                "id": uuid.uuid4().hex, "text": task, "done": False,
-                "created_on": today.isoformat(), "completed_on": None
-            })
-            summary = f"Added to-do: {task}"
 
-        elif kind in ("complete_todo", "reopen_todo", "delete_todo"):
-            selected = next((t for t in updated["todos"] if t["id"] == action.get("id")), None)
-            reason = None
-            if selected is None:
-                selected, reason = _find_todo(updated["todos"], str(action.get("text", "")))
-            if selected is None:
-                errors.append(reason or "Task not found.")
-                continue
-            if kind == "delete_todo":
-                updated["todos"].remove(selected)
-                summary = f"Deleted to-do: {selected['text']}"
+def add_task(title: str, due_date: str | None = None, due_time: str | None = None,
+             priority="Medium", category="General", notes="", *, minutes=30,
+             habit_id: str | None = None, planned_date: str | None = None,
+             new_habit: str = "", new_habit_goal: int = 30) -> str:
+    """Create an unscheduled to-do (optionally planned or with a deadline).
+
+    New habits and the to-do are created in one atomic transaction.
+    """
+    if not title.strip():
+        raise ValueError("The to-do must have a title")
+    minutes = int(minutes)
+    if not 0 <= minutes <= 1440:
+        raise ValueError("Minutes must be between 0 and 1440")
+    task_id = uuid.uuid4().hex
+
+    def update(d):
+        nonlocal habit_id
+        if new_habit.strip():
+            existing = next((h for h in d["habits"] if h["title"].casefold() == new_habit.strip().casefold()), None)
+            if existing:
+                habit_id = existing["id"]
             else:
-                done = kind == "complete_todo"
-                if selected["done"] == done:
-                    errors.append(f"Task already {'complete' if done else 'open'}: {selected['text']}")
-                    continue
-                selected["done"] = done
-                selected["completed_on"] = today.isoformat() if done else None
-                summary = ("Completed" if done else "Reopened") + f" to-do: {selected['text']}"
+                habit_id = uuid.uuid4().hex
+                d["habits"].append({"id": habit_id, "title": new_habit.strip(),
+                                    "target_minutes": max(1, int(new_habit_goal)), "category": category})
+        if habit_id and not any(h["id"] == habit_id for h in d["habits"]):
+            raise ValueError("Linked habit no longer exists")
+        d["tasks"].append({"id": task_id, "title": title.strip(),
+                           "due_date": due_date or None,
+                           "due_time": (due_time or "17:00") if due_date else None,
+                           "planned_date": planned_date or None,
+                           "minutes": minutes, "habit_id": habit_id,
+                           "priority": priority, "category": category,
+                           "notes": notes.strip(), "done": False,
+                           "completed_at": None, "created_at": now_local().isoformat()})
+    change(update)
+    return task_id
 
-        elif kind == "add_habit":
-            habit = str(action.get("habit", "")).strip().lower()
-            if not 1 <= len(habit) <= 50:
-                errors.append("Habit name must be 1–50 characters.")
+
+def set_task_done(task_id: str, done: bool) -> None:
+    def update(d):
+        for task in d["tasks"]:
+            if task["id"] == task_id:
+                if bool(task.get("done")) != bool(done):
+                    task["done"] = bool(done)
+                    task["completed_at"] = now_local().isoformat() if done else None
+                return
+    change(update)
+
+
+def set_task_plan(task_id: str, planned_date: str | None) -> None:
+    def update(d):
+        for task in d["tasks"]:
+            if task["id"] == task_id:
+                task["planned_date"] = planned_date
+                return
+    change(update)
+
+
+def delete_task(task_id: str) -> None:
+    change(lambda d: d.update(tasks=[t for t in d["tasks"] if t["id"] != task_id]))
+
+
+def set_event_checked(event_id: str, checked: bool) -> None:
+    """Retained for backward compatibility; calendar events are no longer checkable."""
+    change(lambda d: d["event_checks"].update({event_id: checked}))
+
+
+def add_habit(title: str, target_minutes: int, category="General") -> str:
+    habit_id = uuid.uuid4().hex
+    change(lambda d: d["habits"].append({"id": habit_id, "title": title.strip(),
+                                         "target_minutes": int(target_minutes), "category": category}))
+    return habit_id
+
+
+def delete_habit(habit_id: str) -> None:
+    def update(d):
+        d["habits"] = [h for h in d["habits"] if h["id"] != habit_id]
+        for task in d["tasks"]:
+            if task.get("habit_id") == habit_id:
+                task["habit_id"] = None
+    change(update)
+
+
+def log_habit(habit_id: str, minutes: int, when: str) -> None:
+    def update(d):
+        day = d["habit_logs"].setdefault(when, {})
+        day[habit_id] = max(0, int(day.get(habit_id, 0)) + minutes)
+    change(update)
+
+
+def task_completion_day(task: dict) -> str | None:
+    if not task.get("done"):
+        return None
+    completed_at = task.get("completed_at")
+    if completed_at:
+        try:
+            stamp = datetime.fromisoformat(completed_at)
+            return (stamp.astimezone(LONDON) if stamp.tzinfo else stamp).date().isoformat()
+        except (TypeError, ValueError):
+            pass
+    return task.get("due_date") or task.get("planned_date")  # Older completed records.
+
+
+def habit_minutes_for_day(data: dict, day: date | str) -> dict[str, int]:
+    """Manual logs + completed task minutes, derived to avoid double counting.
+
+    Unticking, deleting, or reassigning a to-do updates totals automatically.
+    """
+    ds = day.isoformat() if isinstance(day, date) else day
+    result = {hid: max(0, int(mins)) for hid, mins in data["habit_logs"].get(ds, {}).items()}
+    for task in data["tasks"]:
+        hid = task.get("habit_id")
+        if hid and task_completion_day(task) == ds:
+            result[hid] = result.get(hid, 0) + max(0, int(task.get("minutes") or 0))
+    return result
+
+
+def save_screen_time(when: str, total_minutes: int, distracting_minutes: int = 0) -> None:
+    """Manual iPhone Screen Time entry; no automatic Apple Screen Time access."""
+    total, distracting = int(total_minutes), int(distracting_minutes)
+    if not 0 <= distracting <= total <= 1440:
+        raise ValueError("Screen Time values must be between 0 and 1440 minutes")
+    change(lambda d: d["screen_time_logs"].update({when: {
+        "total_minutes": total, "distracting_minutes": distracting}}))
+
+
+def save_day_note(when: str, note: str) -> None:
+    def update(d):
+        previous = d["daily_reviews"].get(when, {})
+        d["daily_reviews"][when] = {**previous, "note": note.strip()}
+    change(update)
+
+
+def add_focus(minutes: int, category: str, when: str, notes: str = "") -> None:
+    change(lambda d: d["focus_logs"].append({"id": uuid.uuid4().hex,
+                                              "date": when, "minutes": int(minutes),
+                                              "category": category, "notes": notes.strip()}))
+
+
+def save_review(when: str, rating: int, note: str) -> None:
+    change(lambda d: d["daily_reviews"].update({when: {"rating": int(rating), "note": note.strip()}}))
+
+
+def add_local_event(title: str, start: datetime, end: datetime, location: str = "", deadline: bool = False) -> str:
+    event_id = "local-" + uuid.uuid4().hex
+    change(lambda d: d["local_events"].append({"id": event_id, "title": title.strip(),
+                                               "start": start.isoformat(), "end": end.isoformat(),
+                                               "source": "Local", "calendar_name": "Momentum",
+                                               "all_day": False, "location": location.strip(),
+                                               "deadline": deadline}))
+    return event_id
+
+
+def daily_agenda(data: dict, day: date) -> list[dict]:
+    """Schedule and planned to-dos, distinguishable by kind (events never tickable)."""
+    ds = day.isoformat()
+    entries = []
+    for task in data["tasks"]:
+        if task.get("planned_date") == ds:
+            entries.append({"kind": "task", "id": task["id"], "title": task["title"],
+                            "time": "To-do", "source": task.get("category", "Task"),
+                            "done": task.get("done", False), "minutes": task.get("minutes", 0),
+                            "priority": task.get("priority", "Medium")})
+    for event in data["calendar_cache"] + data["local_events"]:
+        try:
+            start = datetime.fromisoformat(event["start"])
+            end = datetime.fromisoformat(event["end"])
+            start = (start if start.tzinfo else start.replace(tzinfo=LONDON)).astimezone(LONDON)
+            end = (end if end.tzinfo else end.replace(tzinfo=LONDON)).astimezone(LONDON)
+            if start.date() > day or end.date() < day or (end.date() == day and end.time() == time.min and start.date() != day):
                 continue
-            if habit in updated["habits"]:
-                errors.append("Habit already exists.")
-                continue
-            updated["habits"].append(habit)
-            summary = f"Added habit: {habit}"
-
-        else:
-            errors.append(f"Unsupported action: {kind}")
+        except (KeyError, ValueError, TypeError):
             continue
-
-        if summary:
-            messages.append(summary)
-            updated["events"].append({"time": now.isoformat(timespec="seconds"), "summary": summary})
-
-    return updated, messages, errors
-
-
-VERBS = {
-    "study": "studying", "studied": "studying", "studying": "studying",
-    "read": "reading", "reading": "reading",
-    "exercise": "exercise", "exercised": "exercise", "exercising": "exercise",
-    "worked out": "exercise", "working out": "exercise",
-    "code": "coding", "coded": "coding", "coding": "coding",
-}
-UNIT = r"hours?|hrs?|h|minutes?|mins?|m"
-VERB = "|".join(sorted((re.escape(v) for v in VERBS), key=len, reverse=True))
+        entries.append({"kind": "event", "id": event["id"], "title": event["title"],
+                        "time": "All day" if event.get("all_day") else start.strftime("%H:%M"),
+                        "source": event.get("source", "Calendar"),
+                        "priority": "Deadline" if event.get("deadline") else "Event"})
+    return sorted(entries, key=lambda x: (x["kind"] != "event", x["time"] == "All day", x["time"], x["title"].lower()))
 
 
-def _minutes(amount: str, unit: str) -> int:
-    return round(float(amount) * (60 if unit.lower().startswith(("h",)) else 1))
+def productivity_for_day(data: dict, day: date) -> dict:
+    ds = day.isoformat()
+    planned = [t for t in data["tasks"] if t.get("planned_date") == ds]
+    completed = [t for t in data["tasks"] if task_completion_day(t) == ds]
+    focus = sum(int(x.get("minutes", 0)) for x in data["focus_logs"] if x.get("date") == ds)
+    habit_minutes = sum(habit_minutes_for_day(data, ds).values())
+    return {"tasks": len(planned), "done": len(completed),
+            "focus": focus, "habit_minutes": habit_minutes,
+            "screen_time": (data.get("screen_time_logs", {}).get(ds) or {}).get("total_minutes")}
 
 
-def parse_locally(message: str, *, today: date | None = None) -> list[dict]:
-    """Offline parser for common log/to-do commands; AI covers more varied sentences."""
-    today = today or date.today()
-    parts = re.split(
-        r"\s*(?:;|,|(?<=[.!?])\s+|\band\b(?=\s+(?:i\s+)?(?:studied|study|reading|read|exercised|exercise|coded|coding|add|complete|mark|remove|delete|remind)\b))\s*",
-        message, flags=re.I
-    )
-    actions = []
-    for clause in parts:
-        clause = clause.strip().rstrip(".!")
-        if not clause:
-            continue
-        low = clause.lower()
-        day = (today - timedelta(days=1)).isoformat() if re.search(r"\byesterday\b", low) else today.isoformat()
-
-        task_patterns = (
-            ("add_todo", r"^(?:please\s+)?(?:add|remind me to)\s+(.+)$"),
-            ("complete_todo", r"^(?:please\s+)?(?:complete|finish|mark)\s+(.+)$"),
-            ("delete_todo", r"^(?:please\s+)?(?:remove|delete)\s+(.+)$"),
-        )
-        matched_task = False
-        for kind, pattern in task_patterns:
-            match = re.search(pattern, clause, re.I)
-            if match:
-                task = re.sub(r"\s+(?:to|from)\s+(?:my\s+)?(?:to[- ]?do\s+)?list\s*$", "", match.group(1), flags=re.I)
-                task = re.sub(r"\s+as\s+done\s*$", "", task, flags=re.I).strip()
-                if task:
-                    actions.append({"type": kind, "text": task})
-                matched_task = True
-                break
-        if matched_task:
-            continue
-
-        # An intention to do something later is not time already completed.
-        if re.search(r"\b(?:will|plan to|going to|want to|would like to|need to|have to|intend to)\s+", low):
-            continue
-
-        # Example: "I studied maths for 1.5 hours" or "read 30 mins"
-        match = re.search(
-            rf"\b(?P<verb>{VERB})\b(?:\s+\w+){{0,4}}?\s+(?:for\s+)?(?P<qty>\d+(?:\.\d+)?)\s*(?P<unit>{UNIT})\b",
-            low, re.I
-        )
-        if not match:
-            # Example: "2 hours of studying"
-            match = re.search(
-                rf"\b(?P<qty>\d+(?:\.\d+)?)\s*(?P<unit>{UNIT})\s+(?:of\s+)?(?P<verb>{VERB})\b",
-                low, re.I
-            )
-        if match:
-            mins = _minutes(match.group("qty"), match.group("unit"))
-            trailing = low[match.end():]
-            if match.group("unit").startswith(("h",)):
-                extra = re.match(rf"\s*(?:and\s+)?(\d+)\s*(minutes?|mins?|m)\b", trailing)
-                if extra:
-                    mins += int(extra.group(1))
-            if mins:
-                actions.append({
-                    "type": "log_habit", "habit": VERBS[match.group("verb")],
-                    "minutes": mins, "date": day
-                })
-    return actions
-
-
-def interpret_message(message: str, data: dict, *, today: date | None = None):
-    """Return (actions, source, note). AI is optional and uses ANTHROPIC_API_KEY."""
-    key = os.getenv("ANTHROPIC_API_KEY", "").strip()
-    today = today or date.today()
-    if not key:
-        return parse_locally(message, today=today), "offline", "Offline parser (AI key not configured)."
-
-    system = (
-        "You interpret habit tracker updates. Return ONE JSON object only, containing "
-        "an 'actions' array, never explanatory text. Use only these action types: "
-        "log_habit {type, habit, minutes, date}, add_todo {type, text}, "
-        "complete_todo {type, text}, reopen_todo {type, text}, delete_todo {type, text}, "
-        "add_habit {type, habit}. 'minutes' must be a positive integer (convert hours "
-        "to minutes). For logging use ISO date YYYY-MM-DD, default to today. "
-        "If the user describes a plan or intent (e.g. 'I will study'), do not log "
-        "completed time: add a to-do only if requested. 'I studied' means completed. "
-        "Never infer hours that weren't stated. Keep to-do text concise. "
-        "Do not invent actions, and return an empty actions array for questions. "
-        "When uncertain, return no action rather than guess. "
-    )
-    content = json.dumps({
-        "today": today.isoformat(), "habits": data["habits"],
-        "open_todos": [t["text"] for t in data["todos"] if not t["done"]],
-        "message": message
-    })
+def _due_datetime(task: dict) -> datetime | None:
     try:
-        import anthropic
-        client = anthropic.Anthropic(api_key=key, timeout=15.0, max_retries=1)
-        response = client.messages.create(
-            model=os.getenv("ANTHROPIC_MODEL", "claude-sonnet-4-6"),
-            max_tokens=600,
-            temperature=0,
-            system=system,
-            messages=[{"role": "user", "content": content}]
-        )
-        raw = "".join(block.text for block in response.content if block.type == "text").strip()
-        parsed = json.loads(raw)
-        if not isinstance(parsed, dict) or not isinstance(parsed.get("actions"), list):
-            raise ValueError("AI returned an unexpected format")
-        return parsed["actions"], "AI", "Interpreted with Claude."
-    except Exception as exc:
-        # Failure cannot corrupt saved data; show a minimal error and try locally.
-        actions = parse_locally(message, today=today)
-        return actions, "offline fallback", f"AI unavailable ({type(exc).__name__}); used offline parser."
+        return datetime.combine(date.fromisoformat(task["due_date"]),
+                                time.fromisoformat(task.get("due_time") or "17:00"), tzinfo=LONDON)
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+def pending_alerts(data: dict, now: datetime | None = None) -> list[dict]:
+    """Return imminent deadlines/events not yet sent; caller reserves IDs before toast."""
+    now = (now or now_local()).astimezone(LONDON)
+    thresholds = sorted({int(v) for v in data["settings"].get("alert_minutes", [60, 15]) if int(v) > 0})
+    alerts = []
+    if not data["settings"].get("alerts_enabled", True):
+        return alerts
+    def consider(event_id, name, when, category):
+        if not when:
+            return
+        mins = (when.astimezone(LONDON) - now).total_seconds() / 60
+        matching = next((m for m in thresholds if 0 <= mins <= m), None)
+        if matching is None:
+            return
+        key = f"{category}:{event_id}:{when.isoformat()}:{matching}"
+        if key not in data["notified"]:
+            alerts.append({"key": key, "title": name,
+                           "message": f"{category} in {round(mins)} minutes · {when:%H:%M}",
+                           "when": when})
+    for task in data["tasks"]:
+        if not task.get("done", False):
+            consider(task["id"], task["title"], _due_datetime(task), "Task due")
+    for event in data["calendar_cache"] + data["local_events"]:
+        if event.get("all_day") and not event.get("deadline"):
+            continue  # Ordinary all-day calendar entries aren't timed alerts.
+        try:
+            when = datetime.fromisoformat(event["start"])
+            if when.tzinfo is None:
+                when = when.replace(tzinfo=LONDON)
+            if event.get("all_day") and event.get("deadline"):
+                when = when.astimezone(LONDON).replace(hour=9, minute=0)
+        except (KeyError, ValueError, TypeError):
+            continue
+        consider(event["id"], event["title"], when,
+                 "Deadline" if event.get("deadline") else "Event")
+    return alerts
+
+
+def reserve_alert(key: str) -> bool:
+    """Atomic de-duplication across the web interface and reminder agent."""
+    reserved = False
+    def update(d):
+        nonlocal reserved
+        if key not in d["notified"]:
+            d["notified"][key] = now_local().isoformat()
+            reserved = True
+        # Keep notification history bounded.
+        if len(d["notified"]) > 3000:
+            old = sorted(d["notified"], key=lambda x: d["notified"][x])[:1000]
+            for name in old:
+                del d["notified"][name]
+    change(update)
+    return reserved
